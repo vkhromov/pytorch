@@ -3,6 +3,7 @@
 #include <c10/util/C++17.h>
 #include <c10d/ProcessGroup.hpp>
 #include <torch/csrc/distributed/rpc/request_callback_impl.h>
+#include <torch/csrc/distributed/rpc/rref_context.h>
 
 #include <Python.h>
 
@@ -127,7 +128,6 @@ ProcessGroupAgent::ProcessGroupAgent(
           WorkerInfo(std::move(workerName), pg->getRank()),
           c10::guts::make_unique<RequestCallbackImpl>(),
           rpcTimeout),
-      shutdown_{false},
       pg_(std::move(pg)),
       sendCounts_(pg_->getSize()),
       recvCounts_(pg_->getSize()),
@@ -186,7 +186,8 @@ void ProcessGroupAgent::join() {
   //    feed it a message or kill the thread.
   // 2. A GLOO process cannot send message to itself. (there is an ongoing
   //    effort to fix this problem).
-  shutdown_.store(true);
+  rpcRunning_.store(false);
+
   sync();
   // This is needed in case no futures were created, otherwise the future
   // timeout watchdog would sleep forever.
@@ -269,14 +270,36 @@ void ProcessGroupAgent::sync() {
 }
 
 void ProcessGroupAgent::start() {
+  rpcRunning_.store(true);
   listenerThread_ = std::thread(&ProcessGroupAgent::listenLoop, this);
   futureTimeoutThread_ =
       std::thread(&ProcessGroupAgent::pollTimedOutRPCs, this);
 }
 
+void ProcessGroupAgent::shutdown() {
+  if (!rpcRunning_.load()) {
+    return;
+  }
+  LOG(INFO) << "Stopping ProcessGroupAgent.";
+  rpcRunning_.store(false);
+  {
+    std::unique_lock<std::mutex> lock(recvWorkMutex_);
+    if (recvWork_) {
+      recvWork_->abort();
+    }
+  }
+  listenerThread_.join();
+  futureTimeoutCV_.notify_one();
+  futureTimeoutThread_.join();
+  threadPool_.waitWorkComplete();
+  PythonRpcHandler::getInstance().cleanup();
+  RRefContext::getInstance().destroyInstance();
+}
+
 std::shared_ptr<FutureMessage> ProcessGroupAgent::send(
     const WorkerInfo& to,
     Message&& message) {
+  TORCH_CHECK(rpcRunning_.load(), "ProcessGroupAgent hasn't started.")
   TORCH_CHECK(
       to.id_ < (worker_id_t)pg_->getSize(),
       "Destination rank is out of bound, got ",
@@ -456,10 +479,22 @@ void ProcessGroupAgent::enqueueRecv(RecvWork work) {
 }
 
 void ProcessGroupAgent::listenLoop() {
-  while (true) {
+  while (rpcRunning_.load()) {
     // rank, tensor size, message type
     std::vector<torch::Tensor> preamble = {torch::empty({3}, {torch::kInt64})};
-    pg_->recvAnysource(preamble, pg_->getRank())->wait();
+    {
+      std::lock_guard<std::mutex> guard(recvWorkMutex_);
+      recvWork_ = pg_->recvAnysource(preamble, pg_->getRank());
+    }
+
+    if (!rpcRunning_.load()) {
+      return;
+    }
+    bool aborted = !recvWork_->wait();
+    if (aborted) {
+      continue;
+    }
+
     int64_t* preamble_items = preamble.front().storage().data<int64_t>();
 
     auto srcRank = preamble_items[0];
@@ -483,7 +518,7 @@ void ProcessGroupAgent::listenLoop() {
 }
 
 void ProcessGroupAgent::pollTimedOutRPCs() {
-  while (!shutdown_.load()) {
+  while (rpcRunning_.load()) {
     std::chrono::milliseconds sleepTime;
     std::unique_lock<std::mutex> lock{futureMutex_};
     // Estimate amount of time the first future will time out in, and sleep
@@ -505,7 +540,7 @@ void ProcessGroupAgent::pollTimedOutRPCs() {
       futureTimeoutCV_.wait_for(lock, sleepTime);
     }
 
-    if (shutdown_.load()) {
+    if (!rpcRunning_.load()) {
       return;
     }
 
